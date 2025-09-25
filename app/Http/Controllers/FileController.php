@@ -153,12 +153,26 @@ class FileController extends Controller
             return back()->withErrors(['error' => 'Seu usuário não está associado a uma empresa.'])->withInput();
         }
 
-        // Validação - ARQUIVOS GRANDES PERMITIDOS
-        $request->validate([
+        // Validação - ARQUIVOS GRANDES PERMITIDOS (aumentado para 200MB)
+        $validator = Validator::make($request->all(), [
             'files' => 'required|array|min:1',
-            'files.*' => 'required|file|max:102400', // 100MB
+            'files.*' => 'required|file|max:204800', // 200MB
             'parent_id' => 'nullable|string',
         ]);
+
+        if ($validator->fails()) {
+            \Log::warning('Validação de upload falhou', [
+                'errors' => $validator->errors()->toArray()
+            ]);
+            if ($request->ajax() || $request->wantsJson()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Falha na validação do upload.',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+            return back()->withErrors($validator)->withInput();
+        }
 
         // ====== LIMITE DE ARQUIVOS POR EMPRESA ======
         $empresa = $user->company;
@@ -739,7 +753,7 @@ class FileController extends Controller
             'name' => 'required|string|max:255',
             'description' => 'nullable|string|max:500',
             'parent_id' => 'nullable|string',
-            'file' => 'nullable|file|max:102400', // 100MB max
+            'file' => 'nullable|file|max:204800', // 200MB max
         ]);
 
         if ($validator->fails()) {

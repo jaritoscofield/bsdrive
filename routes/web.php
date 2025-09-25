@@ -392,6 +392,8 @@ Route::middleware(['auth'])->group(function () {
     Route::get('files/{id}/public-stream', [FileController::class, 'publicStream'])
         ->withoutMiddleware(['auth'])
         ->name('files.public-stream');
+    // Status de upload/extracao (polling para modal)
+    Route::get('files/upload-status', [FileController::class, 'uploadStatus'])->name('files.upload-status');
 });
 
 // Rotas para pastas (Google Drive)

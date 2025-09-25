@@ -305,15 +305,20 @@
     @csrf
     <input type="hidden" name="parent_id" value="{{ $folder['id'] }}">
     <input type="file" id="zip-folder-input-gd" name="folder" accept=".zip" required>
+    <button type="submit" style="display:none">Enviar</button>
 </form>
 
 <!-- Modal de progresso -->
 <div id="upload-modal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
     <div class="bg-white rounded-lg p-6 max-w-md w-full mx-4">
-        <h3 class="text-lg font-semibold mb-4">Enviando Arquivo</h3>
+        <h3 class="text-lg font-semibold mb-4">Enviando Arquivo/Pasta</h3>
         <div class="space-y-4">
             <div id="upload-progress" class="space-y-2">
                 <!-- Progress items will be added here -->
+            </div>
+            <div id="extracted-wrapper" class="hidden border-t border-neutral-200 pt-3">
+                <div class="text-sm font-medium text-neutral-700 mb-2">Extração e processamento</div>
+                <div id="extracted-list" class="max-h-40 overflow-auto text-xs text-neutral-600 space-y-1"></div>
             </div>
             <button onclick="closeUploadModal()" class="w-full px-4 py-2 bg-neutral-600 hover:bg-neutral-700 text-white rounded-lg transition-colors duration-200">
                 Fechar
@@ -471,19 +476,88 @@ function confirmDelete(folderId, folderName) {
 </script>
 
 <script>
-// Enviar Pasta ZIP (submit automático ao escolher arquivo) para visão Google Drive
+// Enviar Pasta ZIP com modal/XHR (igual raiz)
 (function(){
     const zipInput = document.getElementById('zip-folder-input-gd');
     if (!zipInput) return;
     zipInput.addEventListener('change', function() {
         if (!zipInput.files || zipInput.files.length === 0) return;
         const file = zipInput.files[0];
-        if (file && file.name && !file.name.toLowerCase().endsWith('.zip')) {
+        if (!file) return;
+        if (file.type !== 'application/zip' && file.type !== 'application/x-zip-compressed') {
             alert('❌ Por favor, selecione um arquivo ZIP (.zip)');
             zipInput.value = '';
             return;
         }
-        document.getElementById('zip-upload-form-gd').submit();
+        const maxSize = 200 * 1024 * 1024; // 200MB
+        if (file.size > maxSize) {
+            alert('❌ O arquivo é muito grande. Máximo permitido: 200MB');
+            zipInput.value = '';
+            return;
+        }
+
+        const modal = document.getElementById('upload-modal');
+        const progressContainer = document.getElementById('upload-progress');
+        if (modal && progressContainer) {
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            progressContainer.innerHTML = `
+                <div class="space-y-2">
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm font-medium text-neutral-700 truncate">${file.name}</span>
+                        <span id="folder-status" class="text-sm text-neutral-500">Preparando...</span>
+                    </div>
+                    <div class="w-full bg-neutral-200 rounded-full h-2">
+                        <div id="folder-progress" class="bg-blue-600 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
+                    </div>
+                </div>
+            `;
+        }
+
+        const formData = new FormData();
+        formData.append('folder', file);
+        formData.append('parent_id', '{{ $folder['id'] }}');
+
+        // CSRF
+        let csrfToken = null;
+        const metaToken = document.querySelector('meta[name="csrf-token"]');
+        if (metaToken && metaToken.content) csrfToken = metaToken.content;
+        const inputTokenEl = document.querySelector('input[name="_token"]');
+        if (!csrfToken && inputTokenEl && inputTokenEl.value) csrfToken = inputTokenEl.value;
+        if (csrfToken) formData.append('_token', csrfToken);
+
+        const xhr = new XMLHttpRequest();
+        xhr.upload.addEventListener('progress', function(ev) {
+            if (ev.lengthComputable) {
+                const pct = (ev.loaded / ev.total) * 100;
+                const bar = document.getElementById('folder-progress');
+                const statusEl = document.getElementById('folder-status');
+                if (bar) bar.style.width = pct + '%';
+                if (statusEl) statusEl.textContent = Math.round(pct) + '%';
+            }
+        });
+        xhr.addEventListener('load', function() {
+            const isHtml = (xhr.getResponseHeader('content-type') || '').includes('text/html');
+            if (xhr.status === 200 && !isHtml) {
+                const statusEl = document.getElementById('folder-status');
+                if (statusEl) { statusEl.textContent = 'Concluído'; statusEl.className = 'text-sm text-green-600'; }
+                setTimeout(() => { location.reload(); }, 800);
+            } else if (xhr.status === 302) {
+                location.reload();
+            } else {
+                const statusEl = document.getElementById('folder-status');
+                if (statusEl) { statusEl.textContent = `Erro (status ${xhr.status})`; statusEl.className = 'text-sm text-red-600'; }
+                console.error('Falha no upload ZIP (subpasta GD):', { status: xhr.status, response: xhr.responseText });
+            }
+        });
+        xhr.addEventListener('error', function() {
+            const statusEl = document.getElementById('folder-status');
+            if (statusEl) { statusEl.textContent = 'Erro de rede'; statusEl.className = 'text-sm text-red-600'; }
+        });
+        xhr.open('POST', '/files/upload-folder', true);
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        if (csrfToken) xhr.setRequestHeader('X-CSRF-TOKEN', csrfToken);
+        xhr.send(formData);
     });
 })();
 </script>
