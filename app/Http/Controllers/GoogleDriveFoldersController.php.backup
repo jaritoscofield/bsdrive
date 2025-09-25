@@ -1,0 +1,317 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Services\GoogleDriveService;
+use Illuminate\Support\Facades\Log;
+
+class GoogleDriveFoldersController extends Controller
+{
+    private $googleDriveService;
+
+    public function __construct(GoogleDriveService $googleDriveService)
+    {
+        $this->googleDriveService = $googleDriveService;
+    }
+
+    /**
+     * Lista todas as pastas do Google Drive
+     */
+    public function index()
+    {
+        try {
+            // O sistema usa uma conta Google única configurada via Service Account
+            // Não é necessário verificar autenticação OAuth individual
+            
+            // Buscar todas as pastas (recursivamente se necessário)
+            $allFolders = $this->getAllFolders();
+            
+            // ADICIONAL: Buscar TODAS as pastas de uma vez (método alternativo)
+            $allFoldersFlat = $this->getAllFoldersFlat();
+
+            // Calcular estatísticas
+            $totalFolders = $this->countFolders($allFolders);
+            $totalFoldersFlat = count($allFoldersFlat);
+            $maxLevel = $this->getMaxLevel($allFolders);
+
+            return view('google-drive.folders', compact('allFolders', 'allFoldersFlat', 'totalFolders', 'totalFoldersFlat', 'maxLevel'));
+
+        } catch (\Exception $e) {
+            Log::error('Erro ao listar pastas do Google Drive: ' . $e->getMessage());
+            
+            return back()->with('error', 'Erro ao carregar pastas: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Busca todas as pastas recursivamente
+     */
+    private function getAllFolders($parentId = null, $level = 0)
+    {
+        $folders = [];
+        
+        try {
+            // Query para buscar apenas pastas
+            $query = "mimeType='application/vnd.google-apps.folder' and trashed=false";
+            if ($parentId) {
+                $query .= " and '{$parentId}' in parents";
+            } else {
+                // Se não especificar parent, busca pastas raiz (sem parent ou em 'root')
+                $query .= " and ('root' in parents or parents=undefined)";
+            }
+
+            $files = $this->googleDriveService->listFiles(
+                null, 
+                'files(id,name,parents,createdTime,modifiedTime,driveId)', 
+                $query
+            );
+
+            foreach ($files as $file) {
+                $folderData = [
+                    'id' => $file['id'] ?? '',
+                    'name' => $file['name'] ?? 'Sem nome',
+                    'parents' => $file['parents'] ?? [],
+                    'createdTime' => $file['createdTime'] ?? null,
+                    'modifiedTime' => $file['modifiedTime'] ?? null,
+                    'level' => $level,
+                    'path' => $this->buildPath($file['id'], $level),
+                    'children' => []
+                ];
+
+                // Buscar subpastas RECURSIVAMENTE (removendo limite de profundidade)
+                // Aumentando limite para 10 níveis para evitar loops infinitos
+                if ($level < 10) {
+                    $folderData['children'] = $this->getAllFolders($file['id'], $level + 1);
+                }
+
+                $folders[] = $folderData;
+            }
+
+            // Ordenar por nome
+            usort($folders, function($a, $b) {
+                return strcasecmp($a['name'], $b['name']);
+            });
+
+        } catch (\Exception $e) {
+            Log::error("Erro ao buscar pastas (level {$level}): " . $e->getMessage());
+        }
+
+        return $folders;
+    }
+
+    /**
+     * Busca TODAS as pastas de uma vez só (método alternativo - mais rápido)
+     */
+    private function getAllFoldersFlat()
+    {
+        $folders = [];
+        
+        try {
+            // Query para buscar TODAS as pastas de uma vez
+            $query = "mimeType='application/vnd.google-apps.folder' and trashed=false";
+
+            // Buscar com paginação para garantir que pegamos todas
+            $pageToken = null;
+            $allFiles = [];
+            
+            do {
+                $optParams = [
+                    'q' => $query,
+                    'fields' => 'files(id,name,parents,createdTime,modifiedTime,driveId),nextPageToken',
+                    'pageSize' => 1000, // Máximo por página
+                    'orderBy' => 'name'
+                ];
+                
+                if ($pageToken) {
+                    $optParams['pageToken'] = $pageToken;
+                }
+
+                $results = $this->googleDriveService->listFiles(null, 'files(id,name,parents,createdTime,modifiedTime,driveId),nextPageToken', $query);
+                
+                if (method_exists($results, 'getFiles')) {
+                    $files = $results->getFiles();
+                    $allFiles = array_merge($allFiles, $files);
+                    $pageToken = method_exists($results, 'getNextPageToken') ? $results->getNextPageToken() : null;
+                } else {
+                    // Se não há paginação, adiciona todos os arquivos
+                    $allFiles = $results;
+                    $pageToken = null;
+                }
+                
+            } while ($pageToken);
+
+            // Processar todas as pastas encontradas
+            foreach ($allFiles as $file) {
+                $parentLevel = $this->calculateLevel($file['id'], $allFiles);
+                
+                $folderData = [
+                    'id' => $file['id'] ?? '',
+                    'name' => $file['name'] ?? 'Sem nome',
+                    'parents' => $file['parents'] ?? [],
+                    'createdTime' => $file['createdTime'] ?? null,
+                    'modifiedTime' => $file['modifiedTime'] ?? null,
+                    'level' => $parentLevel,
+                    'path' => $this->buildPathFromList($file['id'], $allFiles),
+                ];
+
+                $folders[] = $folderData;
+            }
+
+            // Ordenar por nome
+            usort($folders, function($a, $b) {
+                return strcasecmp($a['name'], $b['name']);
+            });
+
+            Log::info("Total de pastas encontradas (método flat): " . count($folders));
+
+        } catch (\Exception $e) {
+            Log::error("Erro ao buscar todas as pastas (flat): " . $e->getMessage());
+        }
+
+        return $folders;
+    }
+
+    /**
+     * Calcula o nível de uma pasta baseado na hierarquia
+     */
+    private function calculateLevel($folderId, $allFolders, $visited = [])
+    {
+        // Evitar loops infinitos
+        if (in_array($folderId, $visited)) {
+            return 0;
+        }
+        
+        $visited[] = $folderId;
+        
+        // Encontrar a pasta atual
+        $currentFolder = null;
+        foreach ($allFolders as $folder) {
+            if ($folder['id'] === $folderId) {
+                $currentFolder = $folder;
+                break;
+            }
+        }
+        
+        if (!$currentFolder || empty($currentFolder['parents'])) {
+            return 0; // Pasta raiz
+        }
+        
+        $parentId = $currentFolder['parents'][0];
+        
+        // Se o parent é 'root', é nível 1
+        if ($parentId === 'root') {
+            return 1;
+        }
+        
+        // Calcular recursivamente
+        return 1 + $this->calculateLevel($parentId, $allFolders, $visited);
+    }
+
+    /**
+     * Constrói o caminho da pasta a partir da lista completa
+     */
+    private function buildPathFromList($folderId, $allFolders, $visited = [])
+    {
+        // Evitar loops infinitos
+        if (in_array($folderId, $visited)) {
+            return 'Caminho circular detectado';
+        }
+        
+        $visited[] = $folderId;
+        
+        // Encontrar a pasta atual
+        $currentFolder = null;
+        foreach ($allFolders as $folder) {
+            if ($folder['id'] === $folderId) {
+                $currentFolder = $folder;
+                break;
+            }
+        }
+        
+        if (!$currentFolder) {
+            return 'Pasta não encontrada';
+        }
+        
+        if (empty($currentFolder['parents']) || $currentFolder['parents'][0] === 'root') {
+            return $currentFolder['name'];
+        }
+        
+        $parentId = $currentFolder['parents'][0];
+        $parentPath = $this->buildPathFromList($parentId, $allFolders, $visited);
+        
+        return $parentPath . ' > ' . $currentFolder['name'];
+    }
+
+    /**
+     * Constrói o caminho da pasta
+     */
+    private function buildPath($folderId, $level)
+    {
+        try {
+            return $this->googleDriveService->getFolderPath($folderId);
+        } catch (\Exception $e) {
+            return "Nível {$level}";
+        }
+    }
+
+    /**
+     * Busca informações detalhadas de uma pasta específica
+     */
+    public function show($folderId)
+    {
+        try {
+            // O sistema usa uma conta Google única configurada via Service Account
+            // Não é necessário verificar autenticação OAuth individual
+
+            $folder = $this->googleDriveService->getFolder($folderId);
+            $files = $this->googleDriveService->listFiles($folderId, 'files(id,name,mimeType,size,createdTime,modifiedTime,parents)');
+            
+            // Separar pastas e arquivos
+            $subfolders = [];
+            $documents = [];
+            
+            foreach ($files as $file) {
+                if ($file['mimeType'] === 'application/vnd.google-apps.folder') {
+                    $subfolders[] = $file;
+                } else {
+                    $documents[] = $file;
+                }
+            }
+
+            return view('google-drive.folder-details', compact('folder', 'subfolders', 'documents'));
+
+        } catch (\Exception $e) {
+            Log::error('Erro ao carregar detalhes da pasta: ' . $e->getMessage());
+            return back()->with('error', 'Erro ao carregar pasta: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Conta o total de pastas recursivamente
+     */
+    private function countFolders($folders)
+    {
+        $count = count($folders);
+        foreach ($folders as $folder) {
+            if (!empty($folder['children'])) {
+                $count += $this->countFolders($folder['children']);
+            }
+        }
+        return $count;
+    }
+
+    /**
+     * Obtém o nível máximo de profundidade
+     */
+    private function getMaxLevel($folders, $currentMax = 0)
+    {
+        foreach ($folders as $folder) {
+            $currentMax = max($currentMax, $folder['level']);
+            if (!empty($folder['children'])) {
+                $currentMax = max($currentMax, $this->getMaxLevel($folder['children'], $currentMax));
+            }
+        }
+        return $currentMax + 1; // +1 para incluir o nível 0
+    }
+}
